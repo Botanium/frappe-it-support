@@ -1,0 +1,76 @@
+{
+  "scan": {
+    "run": "bc-bed2d597-b1d9-5f41-b2bd-cdd99dd6e853",
+    "commit": "9583bed8dc9f2aa8ad3e434b5433c66372387cfb",
+    "focus": "authorization/IDOR/privilege-escalation remaining whitelist RPCs",
+    "attacker": "Website User (All role)"
+  },
+  "findings": [
+    {
+      "severity": "critical",
+      "location": "frappe/deferred_insert.py",
+      "title": "Any logged-in user can queue arbitrary DocType inserts that the hourly scheduler commits as Administrator",
+      "description": "frappe.deferred_insert.deferred_insert is @frappe.whitelist() with no has_permission/only_for check and blindly Redis-RPUSHes attacker-controlled (doctype, records) under insert_queue_for_<doctype>. Hourly scheduler hook frappe.deferred_insert.save_to_db (frappe/hooks.py) runs after frappe.connect(), which always set_user('Administrator'). insert_record then calls Document.insert() under Administrator, so create-permission checks pass for every DocType (and istable DocTypes such as Has Role / DocPerm always return True from has_permission anyway). Designed only for Route History telemetry, but the whitelist accepts any doctype/payload. After insert, frappe.sessions.clear clears the attacker's roles cache so the new System Manager role is effective on the next request.",
+      "impact": "Website User privilege escalation to System Manager (or arbitrary DocType/DocPerm/Custom DocPerm/Email Account creation) once the hourly scheduler runs, yielding full site takeover.",
+      "attack_path": "1. Sign up / authenticate as Website User.\n2. POST /api/method/frappe.deferred_insert.deferred_insert with doctype=Has Role and records as a JSON string: [{\"doctype\":\"Has Role\",\"parent\":\"<attacker_email>\",\"parenttype\":\"User\",\"parentfield\":\"roles\",\"role\":\"System Manager\"}].\n3. Wait for hourly scheduler event frappe.deferred_insert.save_to_db (hooks.py hourly list). Worker calls frappe.connect() \u2192 set_user('Administrator'), then insert_record \u2192 doc.insert() as Administrator.\n4. POST /api/method/frappe.sessions.clear to clear_user_cache (including roles) for the attacker.\n5. Subsequent requests see System Manager via tabHas Role. Alternate payloads: DocPerm/Custom DocPerm granting All write on User, or any other Admin-creatable DocType.",
+      "evidence": [
+        "frappe/deferred_insert.py:8-10",
+        "frappe/deferred_insert.py:12-38",
+        "frappe/hooks.py:173-178",
+        "frappe/__init__.py:178-188",
+        "frappe/permissions.py:52-56",
+        "frappe/sessions.py:24-28",
+        "frappe/cache_manager.py:18-36",
+        "frappe/core/doctype/has_role/has_role.json",
+        "frappe/public/js/frappe/router_history.js:8-10"
+      ],
+      "remediation": "Remove the public whitelist or hard-allowlist deferred_insert to Route History only. Enforce the caller's create permission on doctype before enqueue, and run save_to_db inserts as the originating user (store user on the queue item) rather than Administrator. Reject istable/child DocTypes unless parent write is authorized.",
+      "why_not_duplicate": "Not on the prompt already-reported list and absent from the 52 stored findings. Distinct from update_document_title (field UPDATE via db.set_value) and from get_data_for_custom_field (read dump): this is unauthorized CREATE executed as Administrator via the scheduler queue. Patching title-write or dump endpoints does not touch deferred_insert.py."
+    }
+  ],
+  "near_misses_rechecked": [
+    "email.relink / inbox mark_as_* \u2014 mutation only; content already via get_data_for_custom_field; is_spam only tags Sent",
+    "email_queue.send_now/retry \u2014 names dumpable; force-send does not beat communication.make / update_document_title rewrite",
+    "query_report.save_report \u2014 get_report_doc still gates reference report access",
+    "oauth2 Auto skip_authorization \u2014 config-dependent",
+    "assignment_rule.bulk_apply \u2014 needs pre-existing SM Assignment Rules",
+    "deleted_document.restore \u2014 insert still needs caller create perm",
+    "auto_repeat.update_reference \u2014 same field write class as update_document_title",
+    "List Filter / Kanban save_filters / Desktop Icon \u2014 UI pref sabotage only",
+    "share.add still share-perm; follow_document notify-gated; Post.toggle_like vanity",
+    "handler.run_custom_method dead .is_whitelisted; upload_file guest trampoline default 0",
+    "generate_keys / permission_manager / S3 SM-gated; workflow HMAC; LDAP bind; www/list guest ignore; File.make_thumbnail blind SSRF; safe_exec Script Manager"
+  ],
+  "fully_traced_whitelist_families": [
+    "deferred_insert (NEW CRITICAL)",
+    "email_queue.send_now/retry_sending",
+    "email.relink / inbox.mark_as_* / create_email_flag_queue",
+    "deleted_document.restore",
+    "auto_repeat.update_reference / make_auto_repeat",
+    "query_report.save_report / run / get_script / export / background_enqueue_run",
+    "assignment_rule.bulk_apply",
+    "oauth2.authorize/approve/get_token/revoke",
+    "share.add/set_permission/get_users",
+    "document_follow follow/unfollow/get_follow_users",
+    "desktop_icon update_icons/hide/set_order",
+    "kanban_board save_filters/update_order/update_doc",
+    "list_filter DocType All CRUD",
+    "client insert/save/set_value/get/get_password/get_js/attach_file/rename/make_width_property_setter",
+    "handler run_custom_method/upload_file/runserverobj",
+    "sessions.clear",
+    "user generate_keys/get_roles/get_email_awaiting/reset_otp_secret",
+    "contacts get_contact_details/invite_user",
+    "print_format download_pdf/download_multi_pdf/print_by_server",
+    "energy_point_log review/add_review_points",
+    "mapper map_docs/make_mapped_doc",
+    "workflow apply/bulk/get_transitions",
+    "file move_file/download_file/get_attached_images/create_new_folder",
+    "gantt.update_task",
+    "reportview delete_items/save_report/get_stats",
+    "auto_email_report download/send_now",
+    "chat_profile get/create/update",
+    "paypal/razorpay guest callbacks",
+    "www/list get_list_data",
+    "permission_manager / user_permission / s3_backup / get_backup"
+  ]
+}
