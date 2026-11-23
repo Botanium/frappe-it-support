@@ -1,0 +1,70 @@
+{
+  "repo": "Botanium/frappe-it-support",
+  "framework": "Frappe",
+  "version": "12.3.0",
+  "commit": "f5c5b3be3ae9a7826a74228852cffd098ede8704",
+  "scan_date": "2026-11-23",
+  "scan_focus": "Injection (SQL/command/SSRF/SSTI/header/path/deser) + crypto/secrets + CORS/CSRF",
+  "findings": [
+    {
+      "title": "Default signed-URL HMAC secret falls back to Administrator.creation (guest workflow impersonation)",
+      "severity": "HIGH",
+      "location": "frappe/utils/verified_command.py:get_secret/verify_request; frappe/workflow/doctype/workflow_action/workflow_action.py:confirm_action",
+      "evidence": "get_secret() returns frappe.local.conf.get('secret') or str(frappe.db.get_value('User','Administrator','creation')). No installer/update_site_config path ever provisions conf.secret (only encryption_key is auto-generated). hmac.new() is called without digestmod (MD5 on Py2/3.6/3.7). confirm_action is allow_guest=True: after verify_request() it does frappe.set_user(user) from signed query params then apply_workflow.",
+      "attack_path": "1) On a default site with no site_config.secret, recover Administrator.creation (DB read, backup, or any existing SQLi). 2) Forge _signature over confirm_action params (action, doctype, docname, user=<victim>). 3) Guest GET/POST /api/method/frappe.workflow.doctype.workflow_action.workflow_action.confirm_action?...&_signature=... 4) Server set_user(victim) and applies the workflow transition.",
+      "impact": "Guest forges workflow approval/reject links and impersonates arbitrary users for workflow state changes. Same secret also signs personal-data deletion confirm and related verified_command links.",
+      "why_not_duplicate": "Prior near-miss treated verify_request HMAC as a solid gate. This is a crypto/secrets break of that gate: default key is a DB timestamp, never auto-provisioned as a random secret, and MD5 HMAC. Distinct from unsigned newsletter confirmed_unsubscribe."
+    },
+    {
+      "title": "CSRF validation skipped for device=mobile sessions while sid cookie auth remains",
+      "severity": "HIGH",
+      "location": "frappe/sessions.py:Session.__init__ (device from form_dict); frappe/auth.py:HTTPRequest.validate_csrf_token; frappe/auth.py:CookieManager.flush_cookies",
+      "evidence": "Login stores self.device = frappe.form_dict.get('device') or 'desktop' into session data. validate_csrf_token returns early when session.data.device=='mobile' (also when csrf_token missing). CookieManager.set_cookie writes sid without HttpOnly/SameSite/Secure. POST/PUT still commit via after_request.",
+      "attack_path": "1) Victim uses Frappe mobile/device=mobile login (or any client POSTing device=mobile). 2) Attacker page issues credentialed cross-site POST to /api/method/<any whitelist> without X-Frappe-CSRF-Token. 3) Server skips CSRF check and executes as the victim (e.g. set_value, delete, update_document_title, get_email_template SSTI).",
+      "impact": "Full CSRF against mobile-device cookie sessions: any state-changing whitelisted method runs as the victim, chaining into already-known critical sinks.",
+      "why_not_duplicate": "Not in the stored 52 findings or prompt already-reported injection list. CSRF was an explicit remaining sink. Distinct from ignore_csrf site_config and from GET-only no-commit quirks."
+    },
+    {
+      "title": "Password-reset keys generated with non-CSPRNG random.choice (MT19937)",
+      "severity": "MEDIUM",
+      "location": "frappe/utils/__init__.py:random_string; frappe/core/doctype/user/user.py:User.reset_password",
+      "evidence": "random_string uses from random import choice over ascii_letters+digits. reset_password sets reset_password_key = random_string(32) and emails /update-password?key=. generate_hash (sessions/api secrets) also seeds from random_string(8)+time.time().",
+      "attack_path": "1) Observe MT19937 outputs from other random_string uses in the same process (e.g. uploaded filenames via get_random_filename). 2) Clone PRNG state. 3) Predict subsequent reset_password_key values after triggering reset_password for a target account. 4) Complete guest update_password with the predicted key.",
+      "impact": "Account takeover via predictable password-reset tokens when PRNG state can be recovered.",
+      "why_not_duplicate": "Crypto/secrets issue not previously stored. Distinct from update_document_title writing reset_password_key and from login_oauth_user email trust."
+    },
+    {
+      "title": "OAuth client_secret truncated to 10 hex chars (~40 bits)",
+      "severity": "MEDIUM",
+      "location": "frappe/integrations/doctype/oauth_client/oauth_client.py:validate; frappe/__init__.py:generate_hash",
+      "evidence": "If client_secret empty on save: self.client_secret = frappe.generate_hash(length=10). generate_hash returns sha224(...).hexdigest()[:10] — 16^10 ≈ 2^40 possibilities.",
+      "attack_path": "1) Learn client_id (often public). 2) Offline/online brute-force the 40-bit client_secret. 3) Use the OAuth client credentials in token flows allowed for that client.",
+      "impact": "OAuth client impersonation / unauthorized token issuance for configured OAuth clients.",
+      "why_not_duplicate": "Not previously reported. Distinct from jwt.decode(verify=False) IdP near-miss and from Google Drive/Contacts OAuth token IDOR findings."
+    },
+    {
+      "title": "LDAP TLS hardcodes PROTOCOL_TLSv1 (and CERT_NONE when trust disabled)",
+      "severity": "MEDIUM",
+      "location": "frappe/integrations/doctype/ldap_settings/ldap_settings.py:connect_to_ldap",
+      "evidence": "ldap3.Tls(validate=CERT_REQUIRED or CERT_NONE, version=ssl.PROTOCOL_TLSv1) — TLS 1.0 only, regardless of server capability. require_trusted_certificate!='Yes' sets CERT_NONE.",
+      "attack_path": "1) Site enables LDAP login. 2) Network attacker MITMs LDAP to the directory over TLS 1.0 (or plaintext-equivalent when CERT_NONE). 3) Recover bind credentials / user passwords during authenticate().",
+      "impact": "LDAP credential interception on any deployment using LDAP Settings.",
+      "why_not_duplicate": "Prior LDAP near-miss covered search-filter injection needing bind only. This is a separate crypto/transport weakness."
+    }
+  ],
+  "none_injection_sql_command_ssrf_ssti_path_deser": true,
+  "sinks_fully_traced": [
+    "frappe.db.sql format/f-string/% user-input via whitelist RPCs (re-checked; remaining hits are already-reported classes or sanitizer/SM-gated near-misses)",
+    "subprocess/os.system/Popen (change_log/gitutils installed-apps only; website_theme argv+write; execute_in_shell not HTTP)",
+    "pickle/yaml.load (Redis-only pickle; yaml.load absent; PyYAML 5.1 present but unused unsafely)",
+    "eval/exec/safe_exec (Script Manager + server_script_enabled; error.py exception locals; patches only)",
+    "jinja render_template/get_template (Email Template + auto_repeat already stored; Print/Notification/Address Template/Website Script need SM/Website Manager write; Letter Head All read-only)",
+    "requests.get/urlopen user URLs (get_link_info/report_to_pdf stored; File.make_thumbnail image-blind; webhook/Slack SM; importer can_import; web_page check_broken_links not whitelist)",
+    "open() user paths (get_test_js/socketio/www static/file_url/unzip stored; get_js assets-only; dashboard_chart_source Administrator sources)",
+    "jwt.decode(verify=False) (near-miss: needs valid IdP code; login_oauth_user email trust already stored)",
+    "CORS (no Access-Control-Allow-Origin reflect/allow-all found)",
+    "CSRF (mobile device bypass = NEW finding above; desktop POST still token-gated)",
+    "Header/CRLF (Content-Disposition blocked by Werkzeug 0.16.1)",
+    "validate_link/get_value/get_count/calendar field_map/DatabaseQuery string filters/search_widget/address_query (already reported or same-class near-misses)"
+  ]
+}
