@@ -1,0 +1,70 @@
+{
+  "scan": {
+    "run": "bc-93b96aa9-6527-58ab-9d24-6928a11288ec",
+    "commit": "9583bed8dc9f2aa8ad3e434b5433c66372387cfb",
+    "focus": "authorization/IDOR/privilege-escalation remaining whitelist RPCs",
+    "attacker": "Website User (All role) unless guest path"
+  },
+  "findings": [
+    {
+      "severity": "critical",
+      "location": "frappe/client.py",
+      "title": "Authenticated SQL injection in client.get_count via unsanitized doctype (and filter keys) with no permission check",
+      "description": "frappe.client.get_count is @frappe.whitelist() for every logged-in user and calls frappe.db.count with the client doctype and filters with no has_permission/only_for check. db.count interpolates dt into from `tab%s` with % formatting. An attacker closes the identifier with a backtick and injects UNION/boolean/time-based SQL; the numeric result of UNION ... ORDER BY 1 DESC is returned as the count, enabling character-by-character exfiltration of __Auth password hashes and other tables. Filter dict keys are also concatenated inside backticks (and coalesce second args after `[`) in build_conditions, providing additional injection points. Distinct from client.get_value (checks has_permission(doctype) first and injects via fieldname), DatabaseQuery string filters (get_list path with sanitizers), bulk_update.update, and get_badge_info (different whitelist; patching those endpoints does not fix client.get_count).",
+      "impact": "Any Website User can extract password hashes, TOTP-related rows, and other database contents through the JSON count response, enabling offline cracking and account takeover. Even without SQLi, unrestricted counts of privileged DocTypes are an authorization failure.",
+      "attack_path": "1. Authenticate as Website User (guest signup enabled by default).\n2. POST /api/method/frappe.client.get_count with doctype set to a backtick-breakout payload such as: User` WHERE 0 UNION SELECT ORD(SUBSTRING(password,1,1)) FROM `__Auth` WHERE name='Administrator' AND fieldname='password' ORDER BY 1 DESC -- \n3. Template becomes select count(*) from `tabUser` WHERE 0 UNION SELECT ORD(...) ORDER BY 1 DESC -- ` so the UNION row sorts first and is returned as message.\n4. Repeat ORD/SUBSTRING positions to recover the hash. Alternate: inject via filters JSON object keys into build_conditions backtick/coalesce wrapping.",
+      "evidence": [
+        "frappe/client.py:37-39",
+        "frappe/database/database.py:801-814",
+        "frappe/database/database.py:310-367",
+        "frappe/utils/__init__.py:662-673"
+      ],
+      "remediation": "Require frappe.has_permission(doctype, 'read') before counting. Stop formatting doctype/filter keys into SQL; validate doctype against DocType names and bind identifiers with a strict allowlist. Prefer DatabaseQuery/get_list for permission-aware counts.",
+      "why_not_duplicate": "Not on the prompt already-reported list. Not the same endpoint as get_value, get_badge_info, bulk_update.update, or DatabaseQuery string filters. Concurrent injection pass called it same-class near-miss; overturned because those patches do not touch client.get_count and get_value still gates on doctype read."
+    },
+    {
+      "severity": "critical",
+      "location": "frappe/desk/calendar.py",
+      "title": "Authenticated SQL injection in calendar.get_events via client field_map into ifnull() filter fieldnames",
+      "description": "frappe.desk.calendar.get_events is @frappe.whitelist() and builds start_date/end_date as ifnull(%s, ...) % field_map.start/end from attacker JSON. Those strings are used as filter fieldnames. DatabaseQuery.prepare_filter_condition detects 'ifnull(' in the fieldname and emits the raw string as column_name without backtick wrapping. sanitize_column's ifnull branch only rejects blacklisted keywords as exact whitespace-separated tokens, so space-free payloads with /**/ comments and functions like if()/sleep()/updatexml() pass. Pass fields=[\"name\"] so the payload is not also placed into SELECT (where sanitize_fields is stricter). Event is role All readable, so Website Users reach get_list. Distinct from event.get_events user= IDOR and from DatabaseQuery raw string filters.",
+      "impact": "Any logged-in Website User can run time-based or error-based SQL against the database (password hashes, secrets) through calendar event queries.",
+      "attack_path": "1. Authenticate as Website User.\n2. POST /api/method/frappe.desk.calendar.get_events with doctype=Event, start/end date strings, filters=[], fields=[\"name\"], and field_map JSON whose start value is a space-free injection such as: 1,if(1=1,sleep(5),0))OR/**/ifnull(1\n3. Server builds fieldname ifnull(1,if(1=1,sleep(5),0))OR/**/ifnull(1, '0001-01-01 00:00:00'), sanitize_column allows it, prepare_filter_condition uses it raw, and the Event list query executes the injected SQL.\n4. Use SLEEP/boolean or updatexml/EXTRACTVALUE-style payloads to exfiltrate __Auth or other tables.",
+      "evidence": [
+        "frappe/desk/calendar.py:28-57",
+        "frappe/model/db_query.py:352-367",
+        "frappe/model/db_query.py:516-524",
+        "frappe/utils/data.py:896-898",
+        "frappe/utils/data.py:940-956",
+        "frappe/desk/doctype/event/event.json:274-283"
+      ],
+      "remediation": "Allowlist field_map.start/end/title against meta fieldnames before formatting. Never put client strings into ifnull() SQL. In prepare_filter_condition, do not special-case ifnull( to skip identifier quoting; reject non-identifier fieldnames. Harden sanitize_column to treat ifnull templates as unsafe unless they match a strict regex of known field identifiers.",
+      "why_not_duplicate": "Not on the already-reported list. Distinct from event.get_events user= calendar IDOR (different file/method/bug). Distinct from DatabaseQuery string-filter class: entry is field_map→ifnull unwrap, not a raw string filter element."
+    }
+  ],
+  "near_misses_rechecked": [
+    "Desktop Icon update_icons/hide/set_order user=",
+    "List Filter All CRUD, Kanban save_filters",
+    "email.relink, inbox.mark_as_trash/mark_as_spam",
+    "auto_repeat.update_reference (SM names)",
+    "deleted_document.restore (hash names; insert needs create)",
+    "OAuth Auto skip_authorization (config)",
+    "LDAP needs bind",
+    "www/list.get_list_data ignore_permissions only when allow_guest",
+    "File.make_thumbnail image-blind SSRF",
+    "safe_exec Script Manager + server_script_enabled",
+    "handler.run_custom_method dead .is_whitelisted",
+    "upload_file guest trampoline default allow_guests=0",
+    "share.add share perm; schedule_files_backup/get_backup SM download",
+    "workflow HMAC; permission_manager/generate_keys SM; S3 SM DocType",
+    "remove_attach File has_permission; search_link has_permission(doctype)",
+    "Post.toggle_like vanity; get_email_html PackageLoader; Letter Head read-only",
+    "Energy Point Log in_create; ToDo owner|assigned_by; Workflow Action binds user",
+    "Communication/Activity Log/File/Post/Post Comment if_owner",
+    "assign_to and Google/Note/Notification/Tag/Email Template already reported",
+    "calendar.update_event: Public Event already All-write",
+    "assignment_rule.bulk_apply needs SM Assignment Rules",
+    "chat_profile.get PII overlaps Contact All read",
+    "email_queue.send_now/retry: force-send without body return",
+    "client.make_width_property_setter width-only"
+  ]
+}
